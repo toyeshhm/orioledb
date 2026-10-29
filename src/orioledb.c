@@ -1835,11 +1835,16 @@ orioledb_check_shmem(void)
 }
 
 #define ORIOLEDB_VERSION_CREATED_PREFIX "created = "
+#define ORIOLEDB_VERSION_TMP_FILENAME ORIOLEDB_VERSION_FILENAME ".tmp"
 
 /*
  * Write orioledb_data/ORIOLEDB_VERSION with two lines:
  *   created = <version> <commit>       -- set once, never overwritten
  *   last startup = <version> <commit>  -- updated every startup
+ *
+ * Writes to a temp file, fsyncs, then does durable_rename; follows the
+ * same pattern PostgreSQL uses for postmaster.opts and similar files.
+ * Errors are WARNINGs since this file is diagnostic, not critical.
  */
 static void
 write_orioledb_version_file(void)
@@ -1858,39 +1863,65 @@ write_orioledb_version_file(void)
 		fclose(f);
 	}
 
-	f = fopen(ORIOLEDB_VERSION_FILENAME, PG_BINARY_W);
+	f = fopen(ORIOLEDB_VERSION_TMP_FILENAME, PG_BINARY_W);
 	if (f == NULL)
-		ereport(FATAL,
+	{
+		ereport(WARNING,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\" for writing: %m",
-						ORIOLEDB_VERSION_FILENAME)));
+						ORIOLEDB_VERSION_TMP_FILENAME)));
+		return;
+	}
 
 	if (have_created)
 	{
 		if (fputs(created_line, f) == EOF)
-			ereport(FATAL,
+		{
+			ereport(WARNING,
 					(errcode_for_file_access(),
 					 errmsg("could not write file \"%s\": %m",
-							ORIOLEDB_VERSION_FILENAME)));
+							ORIOLEDB_VERSION_TMP_FILENAME)));
+			fclose(f);
+			return;
+		}
 	}
 	else
 	{
 		if (fprintf(f, "%s%s %s\n",
 					ORIOLEDB_VERSION_CREATED_PREFIX,
 					ORIOLEDB_VERSION, STRINGIZE(COMMIT_HASH)) < 0)
-			ereport(FATAL,
+		{
+			ereport(WARNING,
 					(errcode_for_file_access(),
 					 errmsg("could not write file \"%s\": %m",
-							ORIOLEDB_VERSION_FILENAME)));
+							ORIOLEDB_VERSION_TMP_FILENAME)));
+			fclose(f);
+			return;
+		}
 	}
 
 	if (fprintf(f, "last startup = %s %s\n",
-				ORIOLEDB_VERSION, STRINGIZE(COMMIT_HASH)) < 0 ||
-		fclose(f))
-		ereport(FATAL,
+				ORIOLEDB_VERSION, STRINGIZE(COMMIT_HASH)) < 0)
+	{
+		ereport(WARNING,
 				(errcode_for_file_access(),
 				 errmsg("could not write file \"%s\": %m",
-						ORIOLEDB_VERSION_FILENAME)));
+						ORIOLEDB_VERSION_TMP_FILENAME)));
+		fclose(f);
+		return;
+	}
+
+	if (fflush(f) || fsync(fileno(f)) || fclose(f))
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not flush file \"%s\": %m",
+						ORIOLEDB_VERSION_TMP_FILENAME)));
+		return;
+	}
+
+	durable_rename(ORIOLEDB_VERSION_TMP_FILENAME,
+				   ORIOLEDB_VERSION_FILENAME, WARNING);
 }
 
 /*
