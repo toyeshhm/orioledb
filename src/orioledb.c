@@ -89,6 +89,9 @@
 
 PG_MODULE_MAGIC;
 
+#define STRINGIZE2(s) #s
+#define STRINGIZE(s) STRINGIZE2(s)
+
 static bool debug_disable_pools_limit = false;
 static Pointer shared_segment = NULL;
 static bool shared_segment_initialized = false;
@@ -218,6 +221,7 @@ LocalPagePool local_ppool;
 static size_t page_pools_size[OPagePoolTypesCount];
 
 static void o_base_init_startup_hook(void);
+static void write_orioledb_version_file(void);
 static Size o_proc_shmem_needs(void);
 static void o_proc_shmem_init(Pointer ptr, bool found);
 static Size ppools_shmem_needs(void);
@@ -664,6 +668,7 @@ _PG_init(void)
 	o_verify_dir_exists_or_create(pstrdup(ORIOLEDB_DATA_DIR), NULL, NULL);
 	o_verify_dir_exists_or_create(pstrdup(ORIOLEDB_UNDO_DIR), NULL, NULL);
 	o_verify_dir_exists_or_create(psprintf("%s/1", ORIOLEDB_DATA_DIR), NULL, NULL);
+	write_orioledb_version_file();
 
 	/* See InitializeMaxBackends(), InitProcGlobal() */
 #if PG_VERSION_NUM >= 180000
@@ -1829,6 +1834,65 @@ orioledb_check_shmem(void)
 				 errmsg("orioledb must be loaded via shared_preload_libraries")));
 }
 
+#define ORIOLEDB_VERSION_CREATED_PREFIX "created = "
+
+/*
+ * Write orioledb_data/ORIOLEDB_VERSION with two lines:
+ *   created = <version> <commit>       -- set once, never overwritten
+ *   last startup = <version> <commit>  -- updated every startup
+ */
+static void
+write_orioledb_version_file(void)
+{
+	FILE	   *f;
+	char		created_line[256];
+	bool		have_created = false;
+
+	f = fopen(ORIOLEDB_VERSION_FILENAME, "r");
+	if (f != NULL)
+	{
+		if (fgets(created_line, sizeof(created_line), f) != NULL &&
+			strncmp(created_line, ORIOLEDB_VERSION_CREATED_PREFIX,
+					strlen(ORIOLEDB_VERSION_CREATED_PREFIX)) == 0)
+			have_created = true;
+		fclose(f);
+	}
+
+	f = fopen(ORIOLEDB_VERSION_FILENAME, PG_BINARY_W);
+	if (f == NULL)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\" for writing: %m",
+						ORIOLEDB_VERSION_FILENAME)));
+
+	if (have_created)
+	{
+		if (fputs(created_line, f) == EOF)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not write file \"%s\": %m",
+							ORIOLEDB_VERSION_FILENAME)));
+	}
+	else
+	{
+		if (fprintf(f, "%s%s %s\n",
+					ORIOLEDB_VERSION_CREATED_PREFIX,
+					ORIOLEDB_VERSION, STRINGIZE(COMMIT_HASH)) < 0)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not write file \"%s\": %m",
+							ORIOLEDB_VERSION_FILENAME)));
+	}
+
+	if (fprintf(f, "last startup = %s %s\n",
+				ORIOLEDB_VERSION, STRINGIZE(COMMIT_HASH)) < 0 ||
+		fclose(f))
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m",
+						ORIOLEDB_VERSION_FILENAME)));
+}
+
 /*
  * Test to see if a directory exists.
  *
@@ -2154,11 +2218,6 @@ orioledb_version(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TEXT_P(cstring_to_text(ORIOLEDB_VERSION));
 }
-
-#define COMMIT_HASH_STRING #COMMIT_HASH
-
-#define STRINGIZE2(s) #s
-#define STRINGIZE(s) STRINGIZE2(s)
 
 Datum
 orioledb_commit_hash(PG_FUNCTION_ARGS)
